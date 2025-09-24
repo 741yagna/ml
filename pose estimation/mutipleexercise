@@ -1,0 +1,424 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import math
+import time
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class MultiExerciseFitnessTrainer:
+    def __init__(self):
+        logger.info("Initializing Multi-Exercise Fitness Trainer...")
+        
+        # Initialize MediaPipe Pose (BlazePose)
+        self.mp_pose = mp.solutions.pose
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_drawing_styles = mp.solutions.drawing_styles
+        
+        # Configure BlazePose model
+        self.pose = self.mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            smooth_landmarks=True,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
+        )
+        
+        # Exercise configurations
+        self.exercises = {
+            "squat": {"name": "Squat", "reps": 0, "state": "up"},
+            "pushup": {"name": "Push-Up", "reps": 0, "state": "up"},
+            "shuttle": {"name": "Shuttle Run", "count": 0, "side": "left"}
+        }
+        
+        self.current_exercise = "squat"
+        self.rep_count = 0
+        self.exercise_state = "up"  # up/down for squats/pushups
+        
+        # Shuttle run tracking
+        self.shuttle_start_time = None
+        self.shuttle_position = "center"
+        self.shuttle_count = 0
+        
+        # Performance metrics
+        self.metrics = {
+            "squat_depth": [],
+            "pushup_depth": [],
+            "shuttle_speed": []
+        }
+    
+    def calculate_angle(self, a, b, c):
+        """Calculate angle between three points"""
+        try:
+            a = np.array([a.x, a.y])
+            b = np.array([b.x, b.y])
+            c = np.array([c.x, c.y])
+            
+            ba = a - b
+            bc = c - b
+            
+            cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+            angle = np.arccos(np.clip(cosine_angle, -1, 1))
+            return np.degrees(angle)
+        except:
+            return 0
+    
+    def calculate_distance(self, point1, point2):
+        """Calculate distance between two points"""
+        try:
+            return math.sqrt((point1.x - point2.x)**2 + (point1.y - point2.y)**2)
+        except:
+            return 0
+    
+    # ==================== SQUAT ANALYSIS ====================
+    def analyze_squat(self, landmarks):
+        """Analyze squat form and count reps"""
+        feedback = []
+        metrics = {}
+        
+        try:
+            # Get landmarks
+            left_hip = landmarks[self.mp_pose.PoseLandmark.LEFT_HIP]
+            left_knee = landmarks[self.mp_pose.PoseLandmark.LEFT_KNEE]
+            left_ankle = landmarks[self.mp_pose.PoseLandmark.LEFT_ANKLE]
+            right_hip = landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP]
+            right_knee = landmarks[self.mp_pose.PoseLandmark.RIGHT_KNEE]
+            right_ankle = landmarks[self.mp_pose.PoseLandmark.RIGHT_ANKLE]
+            left_shoulder = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
+            
+            # Calculate angles
+            left_knee_angle = self.calculate_angle(left_hip, left_knee, left_ankle)
+            right_knee_angle = self.calculate_angle(right_hip, right_knee, right_ankle)
+            avg_knee_angle = (left_knee_angle + right_knee_angle) / 2
+            
+            metrics['angle'] = avg_knee_angle
+            self.metrics["squat_depth"].append(avg_knee_angle)
+            
+            # Rep counting logic
+            if self.exercise_state == "up" and avg_knee_angle < 100:
+                self.exercise_state = "down"
+                feedback.append("⬇️ Going down...")
+            elif self.exercise_state == "down" and avg_knee_angle > 160:
+                self.exercise_state = "up"
+                self.rep_count += 1
+                feedback.append("⬆️ Good rep! +1")
+            
+            # Form feedback
+            if avg_knee_angle < 80:
+                feedback.append("✅ Excellent depth!")
+            elif avg_knee_angle < 100:
+                feedback.append("✅ Good depth")
+            else:
+                feedback.append("⚠️ Go deeper - aim for 90°")
+            
+            # Knee alignment
+            knee_distance = abs(left_knee.x - right_knee.x)
+            if knee_distance > 0.15:
+                feedback.append("❌ Knees caving in!")
+            else:
+                feedback.append("✅ Good knee alignment")
+            
+            # Back posture
+            back_angle = self.calculate_angle(left_shoulder, left_hip, left_knee)
+            if back_angle < 150:
+                feedback.append("❌ Keep back straight!")
+            else:
+                feedback.append("✅ Good back posture")
+                
+        except Exception as e:
+            feedback = ["❌ Cannot detect full body - step back"]
+            metrics = {'error': True}
+        
+        return feedback, metrics
+    
+    # ==================== PUSH-UP ANALYSIS ====================
+    def analyze_pushup(self, landmarks):
+        """Analyze push-up form and count reps"""
+        feedback = []
+        metrics = {}
+        
+        try:
+            # Get upper body landmarks
+            left_shoulder = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
+            left_elbow = landmarks[self.mp_pose.PoseLandmark.LEFT_ELBOW]
+            left_wrist = landmarks[self.mp_pose.PoseLandmark.LEFT_WRIST]
+            right_shoulder = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
+            right_elbow = landmarks[self.mp_pose.PoseLandmark.RIGHT_ELBOW]
+            right_wrist = landmarks[self.mp_pose.PoseLandmark.RIGHT_WRIST]
+            left_hip = landmarks[self.mp_pose.PoseLandmark.LEFT_HIP]
+            right_hip = landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP]
+            
+            # Calculate elbow angles (push-up depth)
+            left_elbow_angle = self.calculate_angle(left_shoulder, left_elbow, left_wrist)
+            right_elbow_angle = self.calculate_angle(right_shoulder, right_elbow, right_wrist)
+            avg_elbow_angle = (left_elbow_angle + right_elbow_angle) / 2
+            
+            metrics['angle'] = avg_elbow_angle
+            self.metrics["pushup_depth"].append(avg_elbow_angle)
+            
+            # Rep counting logic for push-ups
+            if self.exercise_state == "up" and avg_elbow_angle < 100:
+                self.exercise_state = "down"
+                feedback.append("⬇️ Lowering...")
+            elif self.exercise_state == "down" and avg_elbow_angle > 160:
+                self.exercise_state = "up"
+                self.rep_count += 1
+                feedback.append("💪 Push! +1 Rep")
+            
+            # Push-up depth feedback
+            if avg_elbow_angle < 90:
+                feedback.append("✅ Chest to floor! Good depth")
+            elif avg_elbow_angle < 120:
+                feedback.append("⚠️ Go a bit lower")
+            else:
+                feedback.append("❌ Too high - go deeper!")
+            
+            # Body alignment (plank position)
+            shoulder_hip_angle = self.calculate_angle(left_shoulder, left_hip, left_knee) if 'left_knee' in locals() else 180
+            
+            if 160 < shoulder_hip_angle < 200:
+                feedback.append("✅ Straight body line")
+            else:
+                feedback.append("❌ Keep body straight - no sagging!")
+            
+            # Elbow position
+            if abs(left_elbow.x - left_shoulder.x) > 0.2:
+                feedback.append("⚠️ Keep elbows closer to body")
+            else:
+                feedback.append("✅ Good elbow position")
+                
+        except Exception as e:
+            feedback = ["❌ Get in push-up position visible to camera"]
+            metrics = {'error': True}
+        
+        return feedback, metrics
+    
+    # ==================== SHUTTLE RUN ANALYSIS ====================
+    def analyze_shuttle_run(self, landmarks):
+        """Analyze shuttle run movements and count laps"""
+        feedback = []
+        metrics = {}
+        
+        try:
+            # Get key landmarks for movement detection
+            nose = landmarks[self.mp_pose.PoseLandmark.NOSE]
+            left_hip = landmarks[self.mp_pose.PoseLandmark.LEFT_HIP]
+            right_hip = landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP]
+            
+            # Calculate center point
+            hip_center_x = (left_hip.x + right_hip.x) / 2
+            
+            # Initialize shuttle run timer
+            if self.shuttle_start_time is None:
+                self.shuttle_start_time = time.time()
+                feedback.append("🏃‍♂️ Shuttle run started! Move side to side")
+            
+            # Detect side movements
+            if hip_center_x < 0.4 and self.shuttle_position != "left":
+                self.shuttle_position = "left"
+                self.shuttle_count += 0.5  # Half lap
+                feedback.append("⬅️ Left side reached!")
+                
+            elif hip_center_x > 0.6 and self.shuttle_position != "right":
+                self.shuttle_position = "right"
+                self.shuttle_count += 0.5  # Half lap
+                feedback.append("➡️ Right side reached!")
+            
+            # Calculate speed and performance
+            elapsed_time = time.time() - self.shuttle_start_time
+            if elapsed_time > 0:
+                speed = self.shuttle_count / elapsed_time
+                metrics['speed'] = speed
+                self.metrics["shuttle_speed"].append(speed)
+            
+            # Full laps (back and forth = 1 lap)
+            full_laps = int(self.shuttle_count // 1)
+            
+            feedback.append(f"🏃 Laps: {full_laps}")
+            feedback.append(f"⏱️ Time: {elapsed_time:.1f}s")
+            feedback.append(f"📊 Speed: {speed:.1f} laps/sec")
+            
+            # Encouragement based on speed
+            if speed > 0.5:
+                feedback.append("🔥 Great pace! Keep going!")
+            elif speed > 0.3:
+                feedback.append("💪 Good effort! Push harder!")
+            else:
+                feedback.append("🚶 Move faster side to side!")
+                
+        except Exception as e:
+            feedback = ["❌ Move within camera view for shuttle run"]
+            metrics = {'error': True}
+        
+        return feedback, metrics
+    
+    def analyze_pose(self, landmarks):
+        """Route to appropriate exercise analyzer"""
+        if self.current_exercise == "squat":
+            return self.analyze_squat(landmarks)
+        elif self.current_exercise == "pushup":
+            return self.analyze_pushup(landmarks)
+        elif self.current_exercise == "shuttle":
+            return self.analyze_shuttle_run(landmarks)
+        else:
+            return ["Select an exercise"], {}
+    
+    def reset_exercise(self, new_exercise):
+        """Reset counters when switching exercises"""
+        self.current_exercise = new_exercise
+        self.rep_count = 0
+        self.exercise_state = "up"
+        
+        if new_exercise == "shuttle":
+            self.shuttle_start_time = None
+            self.shuttle_position = "center"
+            self.shuttle_count = 0
+        else:
+            self.shuttle_start_time = None
+    
+    def process_webcam_frame(self, frame):
+        """Process each webcam frame"""
+        # Convert BGR to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frame.flags.writeable = False
+        
+        # Process with BlazePose
+        results = self.pose.process(rgb_frame)
+        
+        rgb_frame.flags.writeable = True
+        output_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+        
+        feedback = []
+        metrics = {}
+        
+        if results.pose_landmarks:
+            # Analyze the pose
+            feedback, metrics = self.analyze_pose(results.pose_landmarks.landmark)
+            
+            # Draw pose landmarks
+            self.mp_drawing.draw_landmarks(
+                output_frame,
+                results.pose_landmarks,
+                self.mp_pose.POSE_CONNECTIONS,
+                landmark_drawing_spec=self.mp_drawing_styles.get_default_pose_landmarks_style()
+            )
+        
+        return output_frame, feedback, metrics
+
+def main():
+    """Main function to run the fitness trainer"""
+    # Initialize fitness trainer
+    trainer = MultiExerciseFitnessTrainer()
+    
+    # Initialize webcam
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    
+    print("=== MULTI-EXERCISE FITNESS TRAINER ===")
+    print("Available Exercises:")
+    print("S - Squats")
+    print("P - Push-ups") 
+    print("R - Shuttle Runs")
+    print("Q - Quit")
+    print("\nInstructions:")
+    print("- For squats/pushups: Exercise in front of camera")
+    print("- For shuttle runs: Move side to side")
+    print("- Ensure good lighting and full body visibility")
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Flip frame horizontally for mirror view
+        frame = cv2.flip(frame, 1)
+        
+        # Process frame
+        processed_frame, feedback, metrics = trainer.process_webcam_frame(frame)
+        
+        # Display exercise info and counters
+        exercise_name = trainer.exercises[trainer.current_exercise]["name"]
+        
+        # Header information
+        cv2.putText(processed_frame, f"Exercise: {exercise_name}", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+        
+        # Display appropriate counter
+        if trainer.current_exercise == "shuttle":
+            laps = int(trainer.shuttle_count // 1)
+            cv2.putText(processed_frame, f"Laps: {laps}", 
+                       (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        else:
+            cv2.putText(processed_frame, f"Reps: {trainer.rep_count}", 
+                       (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        
+        # Display current angle/metric
+        if 'angle' in metrics:
+            metric_name = "Knee Angle" if trainer.current_exercise == "squat" else "Elbow Angle"
+            cv2.putText(processed_frame, f"{metric_name}: {metrics['angle']:.1f}°", 
+                       (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        elif 'speed' in metrics:
+            cv2.putText(processed_frame, f"Speed: {metrics['speed']:.2f} laps/sec", 
+                       (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        
+        # Display feedback messages
+        y_offset = 130
+        for i, message in enumerate(feedback):
+            if i >= 5:  # Limit to 5 messages to avoid clutter
+                break
+                
+            # Color coding for message types
+            if message.startswith("✅"):
+                color = (0, 255, 0)  # Green
+            elif message.startswith("⚠️"):
+                color = (0, 165, 255)  # Orange
+            elif message.startswith("❌"):
+                color = (0, 0, 255)  # Red
+            elif "⬇️" in message or "⬆️" in message:
+                color = (255, 255, 0)  # Yellow
+            elif "💪" in message or "🔥" in message:
+                color = (0, 255, 255)  # Cyan
+            else:
+                color = (255, 255, 255)  # White
+                
+            cv2.putText(processed_frame, message, (10, y_offset + i*25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        
+        # Display instructions
+        cv2.putText(processed_frame, "S:Squat  P:Push-up  R:Shuttle  Q:Quit", 
+                   (10, processed_frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Show frame
+        cv2.imshow('Multi-Exercise Fitness Trainer', processed_frame)
+        
+        # Handle key presses
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('s'):
+            trainer.reset_exercise("squat")
+            print("Switched to Squats")
+        elif key == ord('p'):
+            trainer.reset_exercise("pushup")
+            print("Switched to Push-ups")
+        elif key == ord('r'):
+            trainer.reset_exercise("shuttle")
+            print("Switched to Shuttle Runs")
+    
+    # Cleanup
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    # Print summary
+    print("\n=== WORKOUT SUMMARY ===")
+    print(f"Final Squat Reps: {trainer.rep_count if trainer.current_exercise == 'squat' else 'N/A'}")
+    print(f"Final Push-up Reps: {trainer.rep_count if trainer.current_exercise == 'pushup' else 'N/A'}")
+    print(f"Final Shuttle Laps: {int(trainer.shuttle_count // 1) if trainer.current_exercise == 'shuttle' else 'N/A'}")
+    print("Great workout! 💪")
+
+if __name__ == "__main__":
+    main()
